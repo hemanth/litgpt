@@ -45,7 +45,7 @@ two matrices of a lower rank.
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Dict, Tuple, Type, Union, Optional
 
 import torch
 import torch.nn as nn
@@ -58,6 +58,7 @@ from litgpt.model import GPT as BaseModel
 from litgpt.model import Block as BaseBlock
 from litgpt.model import CausalSelfAttention as BaseCausalSelfAttention
 from litgpt.model import KVCache
+from litgpt.scripts.convert_hf_checkpoint import qkv_reassemble
 from litgpt.utils import map_old_state_dict_weights
 
 
@@ -122,8 +123,8 @@ class LoRALinear(LoRALayer):
 
         # Actual trainable parameters
         if r > 0:
-            self.lora_A = nn.Parameter(torch.zeros((r, in_features)))
-            self.lora_B = nn.Parameter(torch.zeros((out_features, r)))
+            self.lora_A = nn.Parameter(torch.empty((r, in_features)))
+            self.lora_B = nn.Parameter(torch.empty((out_features, r)))
             self.scaling = self.lora_alpha / self.r
             self.reset_parameters()
 
@@ -144,11 +145,8 @@ class LoRALinear(LoRALayer):
         if self.r > 0 and not self.merged:
             pretrained_dtype = self.linear.weight.data.dtype
             lora_data = self.get_lora_AB()
-            # if the pretrained weights and LoRA weights are of the same dtype - simply sum them
-            if pretrained_dtype == lora_data.dtype:
-                self.linear.weight.data += lora_data
             # if only the pretrained are in quantized form - dequantize, sum with LoRA and quantize the result
-            elif pretrained_dtype == torch.uint8:
+            if pretrained_dtype == torch.uint8:
                 import bitsandbytes as bnb
 
                 weight = self.linear.weight
@@ -160,11 +158,9 @@ class LoRALinear(LoRALayer):
                 self.linear.weight = bnb.nn.Params4bit(weight_data, requires_grad=False, **weight.__dict__)
                 self.linear.weight.cuda(weight.device)
             else:
-                raise NotImplementedError(
-                    f"Cannot merge the pretrained weights of type {pretrained_dtype}"
-                    f" and LoRA weights of type {lora_data.dtype}"
-                )
-
+                # self.linear might be on CPU and lora_data on CUDA
+                # the inplace add will preserve the dtype of linear.weight
+                self.linear.weight.data += lora_data.to(device=self.linear.weight.data.device)
             self.merged = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -185,6 +181,7 @@ class LoRAQKVLinear(LoRALinear):
         in_features: int,
         out_features: int,
         # ↓ the remaining part is for LoRA
+        head_size: int,
         n_head: int,
         n_query_groups: int,
         r: int = 0,
@@ -204,6 +201,7 @@ class LoRAQKVLinear(LoRALinear):
         Args:
             in_features: number of input features of the pretrained weights
             out_features: number of output features of the pretrained weights
+            head_size: size of a single attention head
             n_head: number of attention heads
             n_query_groups: number of query groups (see diagram in `litgpt/config.py`)
             r: rank of the weight update matrices. To make sense of using LoRA the rank should be smaller than the rank of
@@ -218,6 +216,7 @@ class LoRAQKVLinear(LoRALinear):
         """
         super(LoRALinear, self).__init__(r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout)
         self.linear = torch.nn.Linear(in_features, out_features, **kwargs)
+        self.head_size = head_size
         self.n_head = n_head
         self.n_query_groups = n_query_groups
         if isinstance(enable_lora, bool):
@@ -232,17 +231,18 @@ class LoRAQKVLinear(LoRALinear):
         # ⚬ r: 2
         # ⚬ enable_lora: [True, False, True]
         if r > 0 and any(enable_lora):
-            self.lora_A = nn.Parameter(torch.zeros((r * sum(enable_lora), in_features)))  # (4, 128)
+            self.lora_A = nn.Parameter(torch.empty((r * sum(enable_lora), in_features)))  # (4, 128)
             enable_q, enable_k, enable_v = enable_lora
-            self.kv_embd_size = self.linear.in_features // (n_head // n_query_groups)
             # qkv_shapes will be used to split a tensor with weights correctly
             qkv_shapes = (
-                self.linear.in_features * enable_q,
-                self.kv_embd_size * enable_k,
-                self.kv_embd_size * enable_v,
+                # if `head_size` is explicitly specified in the config, `n_embd` (or `in_features`)
+                # might not be equal to `head_size * n_head`, thus we use it directly here
+                head_size * n_head * enable_q,
+                head_size * n_query_groups * enable_k,
+                head_size * n_query_groups * enable_v,
             )
             self.qkv_shapes = [s for s in qkv_shapes if s]
-            self.lora_B = nn.Parameter(torch.zeros(sum(self.qkv_shapes), r))  # (256, 2))
+            self.lora_B = nn.Parameter(torch.empty(sum(self.qkv_shapes), r))  # (256, 2))
             # Notes about shapes above
             # - self.lora_A has shape (4, 128): 4 because rank is 2 and LoRA is applied only to two matrices;
             # 128 is the input size of the x (embedding size). (4, 128) and not (128, 4) because later on in
@@ -260,26 +260,30 @@ class LoRAQKVLinear(LoRALinear):
             # https://github.com/cloneofsimo/lora
             self.scaling = self.lora_alpha / self.r
 
-            # Compute the indices
-            # Indices are needed to properly pad weight updates with zeros in `zero_pad` method.
-            q_per_kv = self.n_head // self.n_query_groups
-            total_qkv = q_per_kv + 2
-            head_size = out_features // (self.n_query_groups * total_qkv)
-            ind = range(out_features)
-            self.lora_ind = []
-            if enable_q:
-                q_ind = [x for x in ind if (x // head_size) % total_qkv < total_qkv - 2]
-                self.lora_ind.extend(q_ind)
-            if enable_k:
-                k_ind = [x for x in ind if (x // head_size) % total_qkv == total_qkv - 2]
-                self.lora_ind.extend(k_ind)
-            if enable_v:
-                v_ind = [x for x in ind if (x // head_size) % total_qkv == total_qkv - 1]
-                self.lora_ind.extend(v_ind)
             self.reset_parameters()
 
+    @property
+    def lora_ind(self) -> torch.Tensor:
+        """Lazy creation of a buffer with LoRA indices to overcome the limitation when FSDP with meta device is used."""
+        # Indices are needed to properly pad weight updates with zeros.
+        if not hasattr(self, "_lora_ind"):
+            enable_q, enable_k, enable_v = self.enable_lora
+            kv_embd_size = self.linear.in_features // (self.n_head // self.n_query_groups)
+            lora_ind = []
+            if enable_q:
+                lora_ind.extend(range(0, self.linear.in_features))
+            if enable_k:
+                lora_ind.extend(range(self.linear.in_features, self.linear.in_features + kv_embd_size))
+            if enable_v:
+                lora_ind.extend(range(self.linear.in_features + kv_embd_size, self.linear.out_features))
+            self.register_buffer(
+                "_lora_ind", torch.tensor(lora_ind, device=self.linear.weight.device), persistent=False
+            )
+
+        return self._lora_ind
+
     def zero_pad(self, x: torch.Tensor) -> torch.Tensor:
-        """Properly pad weight updates with zeros.
+        """Properly pad the last dimension of weight updates with zeros.
 
         If, based on `self.enable_lora`, we want to fine-tune queries and values, but not keys,
         then the weights update should be:
@@ -291,27 +295,6 @@ class LoRAQKVLinear(LoRALinear):
         ________________________________________
         | query         | key       | value    |
         ----------------------------------------
-        For Llama2's GQA support, Q, K, and V weights are interleaved, so that weights for grouped
-        queries are adjacent to their associated key and value weights.
-        For example, suppose we have n_head = 12 with 3 query groups.
-        Then along the embedding dimension the interleaved weights would look like
-
-        [Q, Q, Q, Q, K, V, Q, Q, Q, Q, K, V, Q, Q, Q, Q, K, V],
-
-        where each Q, K, and V has size head_size.
-
-        In this case, the previously-described weight update applies separately to each
-        individual block, so the update will take the form
-
-        [[ΔW,ΔW,ΔW, ..., 0,0,0, ..., ΔW,ΔW,ΔW, ΔW,ΔW,ΔW, ..., 0,0,0, ..., ΔW,ΔW,ΔW, ...],
-         [.............................................................................],
-         [ΔW,ΔW,ΔW, ..., 0,0,0, ..., ΔW,ΔW,ΔW, ΔW,ΔW,ΔW, ..., 0,0,0, ..., ΔW,ΔW,ΔW, ...]]
-             ↑              ↑            ↑        ↑             ↑            ↑
-        ________________________________________________________________________________
-        | q block 1 | k block 1  | v block 1 | q block 2 |  k block 2 |  v block 2 | ...
-        --------------------------------------------------------------------------------
-        Note that in the above diagram, the size of each q block will equal q_per_kv
-        times the size of each k and v block.
 
         Args:
             x: tensor with weights update that will be padded with zeros if necessary
@@ -331,15 +314,13 @@ class LoRAQKVLinear(LoRALinear):
         # Then x has embeddings_size of 256 (2 * 128 as enable_lora only for query and value, not keys) and expected
         # embeddings_size is 384 (self.linear.out_features), so that means that we need to pad from 256 to 384 with zeros, but
         # only for key updates (this is where self.lora_ind comes in handy)
-        # Note: double transpose (in the beginning and in the end) is basically a guard for two-dimensional tensors
-        # for example when we want to merge/unmerge LoRA weights and pretrained weights
-        x = x.transpose(0, 1)
-        result = x.new_zeros((*x.shape[:-1], self.linear.out_features))  # (64, 64, 384)
-        result = result.view(-1, self.linear.out_features)  # (4096, 384)
-        result = result.index_copy(
-            1, torch.tensor(self.lora_ind, device=result.device), x.reshape(-1, sum(self.qkv_shapes))
-        )  # (4096, 256)
-        return result.view((*x.shape[:-1], self.linear.out_features)).transpose(0, 1)  # (64, 64, 384)
+
+        result = x.new_zeros(*x.shape[:-1], self.linear.out_features)  # (64, 64, 384)
+        if result.device.type == "mps":
+            result[..., self.lora_ind] = x
+            return result
+        else:
+            return result.index_copy_(dim=-1, index=self.lora_ind, source=x)  # (64, 64, 384)
 
     def conv1d(self, input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         """An extension of the `torch.nn.functional.conv1d` function with a logic specific to grouped queries.
@@ -373,7 +354,8 @@ class LoRAQKVLinear(LoRALinear):
         input_splitted = input.chunk(sum(self.enable_lora), dim=1)  # N * (B, C // N, T)
         weight_splitted = weight.split(self.qkv_shapes)  # N * (C_output', r, 1)
         return torch.cat(
-            [F.conv1d(a, b) for a, b in zip(input_splitted, weight_splitted)], dim=1  # (B, C_output', T)
+            [F.conv1d(a, b) for a, b in zip(input_splitted, weight_splitted)],
+            dim=1,  # (B, C_output', T)
         )  # (B, C_output, T)
 
     def get_lora_AB(self) -> torch.Tensor:
@@ -388,7 +370,7 @@ class LoRAQKVLinear(LoRALinear):
         ).squeeze(
             0
         )  # (1, 4, 128) @ (256, 2, 1) -> (1, 256, 128) -> (256, 128)
-        return self.zero_pad(lora * self.scaling)  # (256, 128) after zero_pad (384, 128)
+        return self.zero_pad(lora.T * self.scaling).T  # (256, 128) after zero_pad (384, 128)
 
     def merge(self) -> None:
         """Merges the LoRA weights into the full-rank weights (W = W + delta_W)."""
@@ -499,55 +481,31 @@ class Config(BaseConfig):
 
 
 class GPT(BaseModel):
+    # Copy & paste from :class:`model.GPT`. Note that :class:`Block` is new here.
     def __init__(self, config: Config) -> None:
         nn.Module.__init__(self)
         assert config.padded_vocab_size is not None
         self.config = config
 
-        self.lm_head = LoRALinear(
+        self.lm_head = create_lora_linear(
+            config,
             config.n_embd,
             config.padded_vocab_size,
             bias=config.lm_head_bias,
-            r=(config.lora_r if config.lora_head else 0),
-            lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
+            use_r=config.lora_head,
         )
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
-                h=nn.ModuleList(Block(config) for _ in range(config.n_layer)),
+                h=nn.ModuleList(
+                    Block(config, block_idx)
+                    for block_idx in range(config.n_layer)
+                ),
                 ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )
         )
-        self.max_seq_length = self.config.block_size
         self.mask_cache: Optional[torch.Tensor] = None
-
-    def forward(
-        self, idx: torch.Tensor, input_pos: Optional[torch.Tensor] = None, lm_head_chunk_size: int = 0
-    ) -> Union[torch.Tensor, List[torch.Tensor]]:
-        T = idx.size(1)
-        if self.max_seq_length < T:
-            raise ValueError(f"Cannot forward sequence of length {T}, max seq length is only {self.max_seq_length}.")
-
-        if input_pos is not None:  # use the kv cache
-            cos = self.cos.index_select(0, input_pos)
-            sin = self.sin.index_select(0, input_pos)
-            if self.mask_cache is None:
-                raise TypeError("You need to call `gpt.set_kv_cache()`")
-            mask = self.mask_cache.index_select(2, input_pos)
-        else:
-            cos = self.cos[:T]
-            sin = self.sin[:T]
-            mask = None
-
-        x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-        for block in self.transformer.h:
-            x = block(x, cos, sin, mask, input_pos)
-        x = self.transformer.ln_f(x)
-        if lm_head_chunk_size > 0:
-            # chunk the lm head logits to reduce the peak memory used by autograd
-            return [self.lm_head(x_i) for x_i in x.split(lm_head_chunk_size, dim=1)]
-        return self.lm_head(x)  # (B, T, vocab_size)
+        self.max_seq_length = self.config.block_size
 
     @classmethod
     def from_name(cls, name: str, **kwargs: Any) -> Self:
@@ -567,83 +525,87 @@ class GPT(BaseModel):
 
 
 class Block(BaseBlock):
-    def __init__(self, config: Config) -> None:
-        nn.Module.__init__(self)
-        self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
-        self.attn = CausalSelfAttention(config)
-        if not config.shared_attention_norm:
-            self.norm_2 = config.norm_class(config.n_embd, eps=config.norm_eps)
+    def __init__(self, config: Config, block_idx: int) -> None:
+        super().__init__(config, block_idx)
+        self.attn = CausalSelfAttention(config, block_idx)
         self.mlp = config.mlp_class(config)
-
-        self.config = config
 
 
 class CausalSelfAttention(BaseCausalSelfAttention):
-    def __init__(self, config: Config) -> None:
-        # Skip the parent class __init__ altogether and replace it to avoid
-        # useless allocations
-        nn.Module.__init__(self)
-        shape = (config.n_head + 2 * config.n_query_groups) * config.head_size
+    def __init__(self, config: Config, block_idx: int) -> None:
+        super().__init__(config, block_idx)
         # key, query, value projections for all heads, but in a batch
-        self.attn = LoRAQKVLinear(
+        shape = (config.n_head + 2 * config.n_query_groups) * config.head_size
+        self.qkv = LoRAQKVLinear(
             in_features=config.n_embd,
             out_features=shape,
             r=config.lora_r,
             lora_alpha=config.lora_alpha,
             lora_dropout=config.lora_dropout,
             enable_lora=(config.lora_query, config.lora_key, config.lora_value),
-            bias=config.bias,
+            bias=config.bias or config.attn_bias,
             # for MQA/GQA support
+            head_size=config.head_size,
             n_head=config.n_head,
             n_query_groups=config.n_query_groups,
         )
         # output projection
-        # if `head_size` is explicitly specified in the config, `n_emd` might not be equal to `head_size * n_head`
-        self.proj = LoRALinear(
+        self.proj = create_lora_linear(
+            config,
             config.head_size * config.n_head,
             config.n_embd,
-            bias=config.bias,
-            r=(config.lora_r if config.lora_projection else 0),
-            lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
+            use_r=config.lora_projection,
         )
-        # disabled by default
-        self.kv_cache: Optional[KVCache] = None
-
-        self.config = config
 
     def _load_from_state_dict(self, state_dict: Dict, prefix: str, *args: Any, **kwargs: Any) -> None:
-        """For compatibility with base checkpoints."""
+        """For compatibility with base and/or legacy checkpoints."""
         mapping = {
-            "attn.weight": "attn.linear.weight",
-            "attn.bias": "attn.linear.bias",
+            "qkv.weight": "qkv.linear.weight",
+            "qkv.bias": "qkv.linear.bias",
             "proj.weight": "proj.linear.weight",
             "proj.bias": "proj.linear.bias",
         }
         state_dict = map_old_state_dict_weights(state_dict, mapping, prefix)
+
+        for attr in ("weight", "bias"):
+            legacy_key = f"{prefix}attn.linear.{attr}"
+            current_key = f"{prefix}qkv.linear.{attr}"
+            if legacy_key in state_dict:
+                state_dict[current_key] = qkv_reassemble(state_dict.pop(legacy_key), self.config)
+
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+
+def create_lora_linear(
+    config: Config,
+    in_size: int,
+    out_size: int,
+    bias: Optional[Union[float, bool]] = None,
+    use_r: Optional[bool] = None,
+) -> LoRALinear:
+    if bias is None:
+        bias = config.bias
+    if use_r is None:
+        use_r = config.lora_mlp
+    return LoRALinear(
+        in_size,
+        out_size,
+        bias=bias,
+        r=(config.lora_r if use_r else 0),
+        lora_alpha=config.lora_alpha,
+        lora_dropout=config.lora_dropout,
+    )
 
 
 class GptNeoxMLP(litgpt.model.GptNeoxMLP):
     def __init__(self, config: Config) -> None:
         nn.Module.__init__(self)
-        self.fc = LoRALinear(
-            config.n_embd,
-            config.intermediate_size,
-            bias=config.bias,
-            r=(config.lora_r if config.lora_mlp else 0),
-            lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
+        self.fc = create_lora_linear(
+            config, config.n_embd, config.intermediate_size
         )
-        self.proj = LoRALinear(
-            config.intermediate_size,
-            config.n_embd,
-            bias=config.bias,
-            r=(config.lora_r if config.lora_mlp else 0),
-            lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
+        self.proj = create_lora_linear(
+            config, config.intermediate_size, config.n_embd
         )
-
         self.config = config
 
     def _load_from_state_dict(self, state_dict: Dict, prefix: str, *args: Any, **kwargs: Any) -> None:
@@ -661,30 +623,16 @@ class GptNeoxMLP(litgpt.model.GptNeoxMLP):
 class LLaMAMLP(litgpt.model.LLaMAMLP):
     def __init__(self, config: Config) -> None:
         nn.Module.__init__(self)
-        self.fc_1 = LoRALinear(
-            config.n_embd,
-            config.intermediate_size,
-            bias=config.bias,
-            r=(config.lora_r if config.lora_mlp else 0),
-            lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
+        self.fc_1 = create_lora_linear(
+            config, config.n_embd, config.intermediate_size
         )
-        self.fc_2 = LoRALinear(
-            config.n_embd,
-            config.intermediate_size,
-            bias=config.bias,
-            r=(config.lora_r if config.lora_mlp else 0),
-            lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
+        self.fc_2 = create_lora_linear(
+            config, config.n_embd, config.intermediate_size
         )
-        self.proj = LoRALinear(
-            config.intermediate_size,
-            config.n_embd,
-            bias=config.bias,
-            r=(config.lora_r if config.lora_mlp else 0),
-            lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
+        self.proj = create_lora_linear(
+            config, config.intermediate_size, config.n_embd
         )
+        self.config = config
 
     def _load_from_state_dict(self, state_dict: Dict, prefix: str, *args: Any, **kwargs: Any) -> None:
         """For compatibility with base checkpoints."""
@@ -704,23 +652,17 @@ class GemmaMLP(LLaMAMLP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_fc_1 = self.fc_1(x)
         x_fc_2 = self.fc_2(x)
-        x = torch.nn.functional.gelu(x_fc_1) * x_fc_2
+        x = torch.nn.functional.gelu(x_fc_1, approximate=self.config.gelu_approximate) * x_fc_2
         return self.proj(x)
 
 
 class LLaMAMoE(litgpt.model.LLaMAMoE):
     def __init__(self, config: Config) -> None:
         nn.Module.__init__(self)
-        self.gate = LoRALinear(
-            config.n_embd,
-            config.n_expert,
-            bias=False,
-            r=(config.lora_r if config.lora_mlp else 0),
-            lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
+        self.gate = create_lora_linear(
+            config, config.n_embd, config.n_expert, bias=False
         )
         self.experts = nn.ModuleList(LLaMAMLP(config) for _ in range(config.n_expert))
-
         self.config = config
 
     def _load_from_state_dict(self, state_dict: Dict, prefix: str, *args: Any, **kwargs: Any) -> None:

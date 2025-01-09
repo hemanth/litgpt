@@ -1,6 +1,7 @@
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
 
 import itertools
+import math
 import subprocess
 import sys
 from collections import defaultdict
@@ -11,28 +12,50 @@ from re import escape
 import pytest
 import torch
 import yaml
-from conftest import RunIf
 from lightning import Fabric
+
+from litgpt import Config
+from litgpt.generate.sequentially import layer_to_device, replace_device, sequential
+from litgpt.model import GPT, Block
+from litgpt.scripts.download import download_from_hub
+from tests.conftest import RunIf
 
 
 @pytest.mark.parametrize(
     ("n_layer", "devices", "expected"),
     [
+        (6, 1, {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0}),
         (6, 2, {0: 0, 1: 0, 2: 0, 3: 1, 4: 1, 5: 1}),
         (6, 3, {0: 0, 1: 0, 2: 1, 3: 1, 4: 2, 5: 2}),
-        (6, 1, {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0}),
+        (6, 4, {0: 0, 1: 0, 2: 1, 3: 1, 4: 2, 5: 2}),
+        (6, 5, {0: 0, 1: 0, 2: 1, 3: 1, 4: 2, 5: 2}),
+        (6, 6, {0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5}),
     ],
 )
 def test_layer_to_device(n_layer, devices, expected):
-    from litgpt.generate.sequentially import layer_to_device
-    from litgpt.model import GPT, Block
-
     with torch.device("meta"):
         model = GPT.from_name("pythia-14m", n_layer=n_layer)
 
-    actual = layer_to_device(model, Block, chunk_size=n_layer // devices)
+    max_layers_per_device = math.ceil(n_layer / devices)
+    actual = layer_to_device(model, Block, chunk_size=max_layers_per_device)
     expected = {f"transformer.h.{i}": v for i, v in expected.items()}
     assert actual == expected
+
+
+def test_sequential_layer_to_device_mapping_not_possible():
+    # Fewer layers than devices
+    config = Config(n_layer=1)
+    with torch.device("meta"):
+        model = GPT(config)
+    with pytest.raises(ValueError, match="number of layers in the model must be larger than the number of devices"):
+        sequential(model, root=torch.device("cpu"), max_seq_length=128, devices=2)
+
+    # Last device would get 0 layers
+    config = Config(n_layer=6)
+    with torch.device("meta"):
+        model = GPT(config)
+    with pytest.raises(RuntimeError, match="Not able to distribute the 6 layers across 4 devices"):
+        sequential(model, root=torch.device("cpu"), max_seq_length=128, devices=4)
 
 
 def path_to_device(model):
@@ -40,8 +63,6 @@ def path_to_device(model):
 
 
 def test_replace_device():
-    from litgpt.generate.sequentially import replace_device
-
     class Submodule(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -86,9 +107,6 @@ def test_replace_device():
 
 
 def _test_model_1device(accelerator):
-    from litgpt import GPT
-    from litgpt.generate.sequentially import sequential
-
     fabric = Fabric(accelerator=accelerator, devices=1)
     with torch.device("meta"):
         model = GPT.from_name("pythia-14m", n_layer=2)
@@ -99,8 +117,8 @@ def _test_model_1device(accelerator):
         "cos": device_str,
         "sin": device_str,
         "lm_head.weight": device_str,
-        "transformer.h.0.attn.attn.bias": device_str,
-        "transformer.h.0.attn.attn.weight": device_str,
+        "transformer.h.0.attn.qkv.bias": device_str,
+        "transformer.h.0.attn.qkv.weight": device_str,
         "transformer.h.0.attn.proj.bias": device_str,
         "transformer.h.0.attn.proj.weight": device_str,
         "transformer.h.0.mlp.fc.bias": device_str,
@@ -113,8 +131,8 @@ def _test_model_1device(accelerator):
         "transformer.h.0.norm_2.weight": device_str,
         "transformer.h.0.attn.kv_cache.k": device_str,
         "transformer.h.0.attn.kv_cache.v": device_str,
-        "transformer.h.1.attn.attn.bias": device_str,
-        "transformer.h.1.attn.attn.weight": device_str,
+        "transformer.h.1.attn.qkv.bias": device_str,
+        "transformer.h.1.attn.qkv.weight": device_str,
         "transformer.h.1.attn.proj.bias": device_str,
         "transformer.h.1.attn.proj.weight": device_str,
         "transformer.h.1.mlp.fc.bias": device_str,
@@ -157,9 +175,6 @@ def find_forward_hooks(module):
 
 @RunIf(min_cuda_gpus=2)
 def test_model_forward_hooks():
-    from litgpt import GPT
-    from litgpt.generate.sequentially import sequential
-
     fabric = Fabric(accelerator="cuda", devices=1)
     with torch.device("meta"):
         model = GPT.from_name("pythia-14m")  # 6 layers
@@ -172,8 +187,8 @@ def test_model_forward_hooks():
         "transformer.wte.weight": "cuda:0",
         "transformer.h.0.norm_1.weight": "cuda:0",
         "transformer.h.0.norm_1.bias": "cuda:0",
-        "transformer.h.0.attn.attn.weight": "cuda:0",
-        "transformer.h.0.attn.attn.bias": "cuda:0",
+        "transformer.h.0.attn.qkv.weight": "cuda:0",
+        "transformer.h.0.attn.qkv.bias": "cuda:0",
         "transformer.h.0.attn.proj.weight": "cuda:0",
         "transformer.h.0.attn.proj.bias": "cuda:0",
         "transformer.h.0.norm_2.weight": "cuda:0",
@@ -184,8 +199,8 @@ def test_model_forward_hooks():
         "transformer.h.0.mlp.proj.bias": "cuda:0",
         "transformer.h.1.norm_1.weight": "cuda:0",
         "transformer.h.1.norm_1.bias": "cuda:0",
-        "transformer.h.1.attn.attn.weight": "cuda:0",
-        "transformer.h.1.attn.attn.bias": "cuda:0",
+        "transformer.h.1.attn.qkv.weight": "cuda:0",
+        "transformer.h.1.attn.qkv.bias": "cuda:0",
         "transformer.h.1.attn.proj.weight": "cuda:0",
         "transformer.h.1.attn.proj.bias": "cuda:0",
         "transformer.h.1.norm_2.weight": "cuda:0",
@@ -196,8 +211,8 @@ def test_model_forward_hooks():
         "transformer.h.1.mlp.proj.bias": "cuda:0",
         "transformer.h.2.norm_1.weight": "cuda:0",
         "transformer.h.2.norm_1.bias": "cuda:0",
-        "transformer.h.2.attn.attn.weight": "cuda:0",
-        "transformer.h.2.attn.attn.bias": "cuda:0",
+        "transformer.h.2.attn.qkv.weight": "cuda:0",
+        "transformer.h.2.attn.qkv.bias": "cuda:0",
         "transformer.h.2.attn.proj.weight": "cuda:0",
         "transformer.h.2.attn.proj.bias": "cuda:0",
         "transformer.h.2.norm_2.weight": "cuda:0",
@@ -208,8 +223,8 @@ def test_model_forward_hooks():
         "transformer.h.2.mlp.proj.bias": "cuda:0",
         "transformer.h.3.norm_1.weight": "cuda:1",
         "transformer.h.3.norm_1.bias": "cuda:1",
-        "transformer.h.3.attn.attn.weight": "cuda:1",
-        "transformer.h.3.attn.attn.bias": "cuda:1",
+        "transformer.h.3.attn.qkv.weight": "cuda:1",
+        "transformer.h.3.attn.qkv.bias": "cuda:1",
         "transformer.h.3.attn.proj.weight": "cuda:1",
         "transformer.h.3.attn.proj.bias": "cuda:1",
         "transformer.h.3.norm_2.weight": "cuda:1",
@@ -220,8 +235,8 @@ def test_model_forward_hooks():
         "transformer.h.3.mlp.proj.bias": "cuda:1",
         "transformer.h.4.norm_1.weight": "cuda:1",
         "transformer.h.4.norm_1.bias": "cuda:1",
-        "transformer.h.4.attn.attn.weight": "cuda:1",
-        "transformer.h.4.attn.attn.bias": "cuda:1",
+        "transformer.h.4.attn.qkv.weight": "cuda:1",
+        "transformer.h.4.attn.qkv.bias": "cuda:1",
         "transformer.h.4.attn.proj.weight": "cuda:1",
         "transformer.h.4.attn.proj.bias": "cuda:1",
         "transformer.h.4.norm_2.weight": "cuda:1",
@@ -232,8 +247,8 @@ def test_model_forward_hooks():
         "transformer.h.4.mlp.proj.bias": "cuda:1",
         "transformer.h.5.norm_1.weight": "cuda:1",
         "transformer.h.5.norm_1.bias": "cuda:1",
-        "transformer.h.5.attn.attn.weight": "cuda:1",
-        "transformer.h.5.attn.attn.bias": "cuda:1",
+        "transformer.h.5.attn.qkv.weight": "cuda:1",
+        "transformer.h.5.attn.qkv.bias": "cuda:1",
         "transformer.h.5.attn.proj.weight": "cuda:1",
         "transformer.h.5.attn.proj.bias": "cuda:1",
         "transformer.h.5.norm_2.weight": "cuda:1",
@@ -274,9 +289,6 @@ root = Path(__file__).parent.parent.resolve()
 
 @RunIf(min_cuda_gpus=2)
 def test_base_with_sequentially(tmp_path):
-    from litgpt import GPT, Config
-    from litgpt.scripts.download import download_from_hub
-
     # download the tokenizer
     download_from_hub(repo_id="EleutherAI/pythia-14m", tokenizer_only=True, checkpoint_dir=tmp_path)
     checkpoint_dir = tmp_path / "EleutherAI/pythia-14m"
@@ -287,29 +299,22 @@ def test_base_with_sequentially(tmp_path):
     torch.save(GPT(config).state_dict(), checkpoint_dir / "lit_model.pth")
 
     args = [
+        str(checkpoint_dir),
         "--num_samples=1",
         "--max_new_tokens=10",
         "--precision=16-true",
         "--temperature=0.0",
-        f"--checkpoint_dir={str(checkpoint_dir)}",
     ]
     env = {"CUDA_VISIBLE_DEVICES": "0,1"}
-    base_stdout = subprocess.check_output([sys.executable, root / "litgpt/generate/base.py", *args], env=env).decode()
     sequential_stdout = subprocess.check_output(
-        [sys.executable, root / "litgpt/generate/sequentially.py", *args], env=env
+        [sys.executable, "-m", "litgpt", "generate_sequentially", *args], env=env, cwd=root,
     ).decode()
 
-    assert base_stdout.startswith("What food do llamas eat?")
-    assert base_stdout == sequential_stdout
+    assert "What food do llamas eat?" in sequential_stdout
 
 
-@pytest.mark.parametrize("mode", ["file", "entrypoint"])
-def test_cli(mode):
-    if mode == "file":
-        cli_path = Path(__file__).parent.parent / "litgpt/generate/sequentially.py"
-        args = [sys.executable, cli_path, "-h"]
-    else:
-        args = ["litgpt", "generate", "sequentially", "-h"]
+def test_cli():
+    args = ["litgpt", "generate_sequentially", "-h"]
     output = subprocess.check_output(args)
     output = str(output.decode())
-    assert "Generates text samples" in output
+    assert "Generation script that partitions layers across" in output

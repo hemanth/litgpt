@@ -9,7 +9,7 @@ Port for LitGPT
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Type
+from typing import Any, Dict, Type, Optional
 
 import torch
 import torch.nn as nn
@@ -17,10 +17,10 @@ from typing_extensions import Self
 
 import litgpt
 from litgpt.adapter import GPT as BaseModel
-from litgpt.adapter import Block as BaseBlock
+from litgpt.model import Block as BaseBlock
 from litgpt.adapter import CausalSelfAttention as BaseCausalSelfAttention
 from litgpt.adapter import Config as BaseConfig
-from litgpt.model import KVCache
+from litgpt.scripts.convert_hf_checkpoint import qkv_reassemble
 from litgpt.utils import map_old_state_dict_weights
 
 
@@ -63,22 +63,27 @@ class AdapterV2Linear(torch.nn.Module):
 
 
 class GPT(BaseModel):
+    # Copy & paste from :class:`model.GPT`. Note that :class:`Block` is new here.
     def __init__(self, config: Config) -> None:
-        # Skip the parent class __init__ altogether and replace it to avoid useless allocations
         nn.Module.__init__(self)
         assert config.padded_vocab_size is not None
         self.config = config
 
-        self.lm_head = AdapterV2Linear(config.n_embd, config.padded_vocab_size, bias=config.lm_head_bias)
+        self.lm_head = AdapterV2Linear(
+            config.n_embd, config.padded_vocab_size, bias=config.lm_head_bias
+        )
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
-                h=nn.ModuleList(Block(config, i) for i in range(config.n_layer)),
+                h=nn.ModuleList(
+                    Block(config, block_idx)
+                    for block_idx in range(config.n_layer)
+                ),
                 ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )
         )
-        self.max_seq_length = self.config.block_size
         self.mask_cache: Optional[torch.Tensor] = None
+        self.max_seq_length = self.config.block_size
 
     @classmethod
     def from_name(cls, name: str, **kwargs: Any) -> Self:
@@ -98,52 +103,35 @@ class GPT(BaseModel):
 
 
 class Block(BaseBlock):
-    """The implementation is identical to `litgpt.model.Block` with the exception that
-    we replace the attention layer where adaption is implemented."""
-
     def __init__(self, config: Config, block_idx: int) -> None:
-        # Skip the parent class __init__ altogether and replace it to avoid useless allocations
-        nn.Module.__init__(self)
-        self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
+        super().__init__(config, block_idx)
         self.attn = CausalSelfAttention(config, block_idx)
-        if not config.shared_attention_norm:
-            self.norm_2 = config.norm_class(config.n_embd, eps=config.norm_eps)
         self.mlp = config.mlp_class(config)
-
-        self.config = config
 
 
 class CausalSelfAttention(BaseCausalSelfAttention):
     """A modification of `litgpt.adapter.CausalSelfAttention` that uses the Adapter V2 Linear class"""
 
+    # Copy&paste from :class:`model.CausalSelfAttention`
     def __init__(self, config: Config, block_idx: int) -> None:
-        # Skip the parent class __init__ altogether and replace it to avoid useless allocations
-        nn.Module.__init__(self)
-        shape = (config.n_head + 2 * config.n_query_groups) * config.head_size
+        super().__init__(config, block_idx)
         # key, query, value projections for all heads, but in a batch
-        self.attn = AdapterV2Linear(in_features=config.n_embd, out_features=shape, bias=config.bias)
+        shape = (config.n_head + 2 * config.n_query_groups) * config.head_size
+        self.qkv = AdapterV2Linear(
+            in_features=config.n_embd,
+            out_features=shape,
+            bias=config.bias or config.attn_bias
+        )
         # output projection
-        # if `head_size` is explicitly specified in the config, `n_emd` might not be equal to `head_size * n_head`
-        self.proj = AdapterV2Linear(config.head_size * config.n_head, config.n_embd, bias=config.bias)
-        # disabled by default
-        self.kv_cache: Optional[KVCache] = None
-
-        if block_idx >= config.adapter_start_layer:
-            # adapter embedding layer
-            self.adapter_wte = nn.Embedding(config.adapter_prompt_length, config.n_embd)
-            # gate for adaption
-            self.gating_factor = torch.nn.Parameter(torch.zeros(1, 1, config.n_head, 1))
-            # kv cache for inference
-            self.adapter_kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-        self.block_idx = block_idx
-
-        self.config = config
+        self.proj = AdapterV2Linear(
+            config.head_size * config.n_head, config.n_embd, bias=config.bias
+        )
 
     def _load_from_state_dict(self, state_dict: Dict, prefix: str, *args: Any, **kwargs: Any) -> None:
-        """For compatibility with base checkpoints."""
+        """For compatibility with base and/or legacy checkpoints."""
         mapping = {
-            "attn.weight": "attn.linear.weight",
-            "attn.bias": "attn.linear.bias",
+            "qkv.weight": "qkv.linear.weight",
+            "qkv.bias": "qkv.linear.bias",
             "proj.weight": "proj.linear.weight",
             "proj.bias": "proj.linear.bias",
         }
@@ -151,15 +139,25 @@ class CausalSelfAttention(BaseCausalSelfAttention):
         # For compatibility with older checkpoints
         if (key := prefix + "gating_factor") in state_dict and state_dict[key].size(1) == self.config.n_head:
             state_dict[key] = state_dict[key].permute(0, 2, 1, 3)
+
+        for attr in ("weight", "bias"):
+            legacy_key = f"{prefix}attn.linear.{attr}"
+            current_key = f"{prefix}qkv.linear.{attr}"
+            if legacy_key in state_dict:
+                state_dict[current_key] = qkv_reassemble(state_dict.pop(legacy_key), self.config)
+
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
 
 class GptNeoxMLP(litgpt.model.GptNeoxMLP):
     def __init__(self, config: Config) -> None:
         nn.Module.__init__(self)
-        self.fc = AdapterV2Linear(config.n_embd, config.intermediate_size, bias=config.bias)
-        self.proj = AdapterV2Linear(config.intermediate_size, config.n_embd, bias=config.bias)
-
+        self.fc = AdapterV2Linear(
+            config.n_embd, config.intermediate_size, bias=config.bias
+        )
+        self.proj = AdapterV2Linear(
+            config.intermediate_size, config.n_embd, bias=config.bias
+        )
         self.config = config
 
     def _load_from_state_dict(self, state_dict: Dict, prefix: str, *args: Any, **kwargs: Any) -> None:
@@ -177,9 +175,16 @@ class GptNeoxMLP(litgpt.model.GptNeoxMLP):
 class LLaMAMLP(litgpt.model.LLaMAMLP):
     def __init__(self, config: Config) -> None:
         nn.Module.__init__(self)
-        self.fc_1 = AdapterV2Linear(config.n_embd, config.intermediate_size, bias=config.bias)
-        self.fc_2 = AdapterV2Linear(config.n_embd, config.intermediate_size, bias=config.bias)
-        self.proj = AdapterV2Linear(config.intermediate_size, config.n_embd, bias=config.bias)
+        self.fc_1 = AdapterV2Linear(
+            config.n_embd, config.intermediate_size, bias=config.bias
+        )
+        self.fc_2 = AdapterV2Linear(
+            config.n_embd, config.intermediate_size, bias=config.bias
+        )
+        self.proj = AdapterV2Linear(
+            config.intermediate_size, config.n_embd, bias=config.bias
+        )
+        self.config = config
 
     def _load_from_state_dict(self, state_dict: Dict, prefix: str, *args: Any, **kwargs: Any) -> None:
         """For compatibility with base checkpoints."""
@@ -199,7 +204,7 @@ class GemmaMLP(LLaMAMLP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_fc_1 = self.fc_1(x)
         x_fc_2 = self.fc_2(x)
-        x = torch.nn.functional.gelu(x_fc_1) * x_fc_2
+        x = torch.nn.functional.gelu(x_fc_1, approximate=self.config.gelu_approximate) * x_fc_2
         return self.proj(x)
 
 
@@ -208,7 +213,6 @@ class LLaMAMoE(litgpt.model.LLaMAMoE):
         nn.Module.__init__(self)
         self.gate = AdapterV2Linear(config.n_embd, config.n_expert, bias=False)
         self.experts = nn.ModuleList(LLaMAMLP(config) for _ in range(config.n_expert))
-
         self.config = config
 
     def _load_from_state_dict(self, state_dict: Dict, prefix: str, *args: Any, **kwargs: Any) -> None:
